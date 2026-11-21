@@ -119,6 +119,7 @@ typedef struct {
   unsigned long start_requested_count;
   unsigned long start_count;
   unsigned long exit_count;
+  bool use_conpty;
 } nssm_service_t;
 
 void WINAPI service_main(unsigned long, TCHAR **);

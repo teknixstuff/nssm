@@ -168,6 +168,8 @@ int create_parameters(nssm_service_t *service, bool editing) {
   }
   if (service->timestamp_log) set_number(key, NSSM_REG_TIMESTAMP_LOG, 1);
   else if (editing) RegDeleteValue(key, NSSM_REG_TIMESTAMP_LOG);
+  if (service->use_conpty) set_number(key, NSSM_REG_USE_CONPTY, 1);
+  else if (editing) RegDeleteValue(key, NSSM_REG_USE_CONPTY);
   if (service->hook_share_output_handles) set_number(key, NSSM_REG_HOOK_SHARE_OUTPUT_HANDLES, 1);
   else if (editing) RegDeleteValue(key, NSSM_REG_HOOK_SHARE_OUTPUT_HANDLES);
   if (service->rotate_files) set_number(key, NSSM_REG_ROTATE, 1);
@@ -837,6 +839,13 @@ int get_parameters(nssm_service_t *service, STARTUPINFO *si) {
     else service->timestamp_log = false;
   }
   else service->timestamp_log = false;
+
+  /* Try to get ConPTY settings - may fail. */
+  unsigned long use_conpty;
+  if (get_number(key, NSSM_REG_USE_CONPTY, &use_conpty, false) == 1) {
+    if (use_conpty) service->use_conpty = true;
+    else service->use_conpty = false;
+  } else service->use_conpty = false;
 
   /* Hook I/O sharing and online rotation need a pipe. */
   service->use_stdout_pipe = service->rotate_stdout_online || service->timestamp_log || hook_share_output_handles;

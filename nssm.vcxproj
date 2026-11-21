@@ -311,6 +311,7 @@
     <ClInclude Include="nssm.h" />
     <ClInclude Include="process.h" />
     <ClInclude Include="registry.h" />
+    <ClInclude Include="resource.h" />
     <ClInclude Include="service.h" />
     <ClInclude Include="settings.h" />
     <ClInclude Include="utf8.h" />

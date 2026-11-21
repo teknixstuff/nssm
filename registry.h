@@ -33,6 +33,7 @@
 #define NSSM_REG_ROTATE_BYTES_HIGH _T("AppRotateBytesHigh")
 #define NSSM_REG_ROTATE_DELAY _T("AppRotateDelay")
 #define NSSM_REG_TIMESTAMP_LOG _T("AppTimestampLog")
+#define NSSM_REG_USE_CONPTY _T("AppUseConPTY")
 #define NSSM_REG_PRIORITY _T("AppPriority")
 #define NSSM_REG_AFFINITY _T("AppAffinity")
 #define NSSM_REG_NO_CONSOLE _T("AppNoConsole")
