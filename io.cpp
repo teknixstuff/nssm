@@ -127,9 +127,32 @@ static int create_conpty_pipe_security(SECURITY_ATTRIBUTES* sa, PSECURITY_DESCRI
   return 0;
 }
 
+static bool conpty_write_pipe_all(HANDLE pipe, const char* data, unsigned long len, OVERLAPPED* wov) {
+  unsigned long sent = 0;
+  while (sent < len) {
+    ResetEvent(wov->hEvent);
+    wov->Offset = 0;
+    wov->OffsetHigh = 0;
+
+    unsigned long written = 0;
+    if (!WriteFile(pipe, data + sent, len - sent, &written, wov)) {
+      if (GetLastError() != ERROR_IO_PENDING) return false;
+      if (!GetOverlappedResult(pipe, wov, &written, TRUE)) return false;
+    }
+    if (written == 0) return false;
+    sent += written;
+  }
+  return true;
+}
+
 static unsigned long WINAPI conpty_output_drain_thread(void* param) {
   conpty_session_t* s = (conpty_session_t*)param;
   char buf[CONPTY_IO_BUFFER];
+
+  HANDLE write_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+  OVERLAPPED write_ov;
+  ZeroMemory(&write_ov, sizeof(write_ov));
+  write_ov.hEvent = write_event;
 
   while (!InterlockedCompareExchange(&s->stop, 0, 0)) {
     unsigned long read_bytes = 0;
@@ -139,20 +162,23 @@ static unsigned long WINAPI conpty_output_drain_thread(void* param) {
 
     ringbuf_append(&s->ring, buf, read_bytes);
 
+    HANDLE pipe_snap = INVALID_HANDLE_VALUE;
     if (s->pipe_cs_initialised) EnterCriticalSection(&s->pipe_cs);
-    if (s->active_pipe && s->active_pipe != INVALID_HANDLE_VALUE) {
-      unsigned long sent = 0;
-      while (sent < read_bytes) {
-        unsigned long written = 0;
-        if (!WriteFile(s->active_pipe, buf + sent, read_bytes - sent, &written, NULL)) {
-          break;
+    pipe_snap = s->active_pipe;
+    if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
+
+    if (pipe_snap && pipe_snap != INVALID_HANDLE_VALUE && write_event) {
+      if (!conpty_write_pipe_all(pipe_snap, buf, read_bytes, &write_ov)) {
+        if (s->pipe_cs_initialised) EnterCriticalSection(&s->pipe_cs);
+        if (s->active_pipe == pipe_snap) {
+          s->active_pipe = INVALID_HANDLE_VALUE;
         }
-        sent += written;
+        if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
       }
     }
-    if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
   }
 
+  if (write_event) CloseHandle(write_event);
   return 0;
 }
 
@@ -168,10 +194,21 @@ static unsigned long WINAPI conpty_pipe_server_thread(void* param) {
     return 1;
   }
 
+  HANDLE connect_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+  HANDLE read_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+  HANDLE hist_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+  if (!connect_event || !read_event || !hist_event) {
+    if (connect_event) CloseHandle(connect_event);
+    if (read_event) CloseHandle(read_event);
+    if (hist_event) CloseHandle(hist_event);
+    if (psd) LocalFree(psd);
+    return 1;
+  }
+
   while (!InterlockedCompareExchange(&s->stop, 0, 0)) {
     HANDLE pipe = CreateNamedPipe(
       pipe_name,
-      PIPE_ACCESS_DUPLEX,
+      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
       1,
       CONPTY_IO_BUFFER,
@@ -187,8 +224,31 @@ static unsigned long WINAPI conpty_pipe_server_thread(void* param) {
       break;
     }
 
-    BOOL connected = ConnectNamedPipe(pipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+    ResetEvent(connect_event);
+    OVERLAPPED connect_ov;
+    ZeroMemory(&connect_ov, sizeof(connect_ov));
+    connect_ov.hEvent = connect_event;
+
+    BOOL connected = ConnectNamedPipe(pipe, &connect_ov);
+    if (!connected) {
+      unsigned long err = GetLastError();
+      if (err == ERROR_PIPE_CONNECTED) {
+        connected = TRUE;
+      } else if (err == ERROR_IO_PENDING) {
+        while (!InterlockedCompareExchange(&s->stop, 0, 0)) {
+          unsigned long wr = WaitForSingleObject(connect_event, 200);
+          if (wr == WAIT_OBJECT_0) {
+            unsigned long dummy = 0;
+            connected = GetOverlappedResult(pipe, &connect_ov, &dummy, FALSE);
+            break;
+          }
+          if (wr == WAIT_FAILED) break;
+        }
+      }
+    }
+
     if (!connected || InterlockedCompareExchange(&s->stop, 0, 0)) {
+      if (imports.CancelIoEx) imports.CancelIoEx(pipe, &connect_ov);
       CloseHandle(pipe);
       break;
     }
@@ -196,16 +256,11 @@ static unsigned long WINAPI conpty_pipe_server_thread(void* param) {
     size_t hist_len = 0;
     char* history = ringbuf_snapshot(&s->ring, &hist_len);
     if (history && hist_len > 0) {
-      if (s->pipe_cs_initialised) EnterCriticalSection(&s->pipe_cs);
-      unsigned long sent = 0;
-      while (sent < hist_len) {
-        unsigned long written = 0;
-        if (!WriteFile(pipe, history + sent, (unsigned long)(hist_len - sent), &written, NULL)) {
-          break;
-        }
-        sent += written;
-      }
-      if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
+      OVERLAPPED hist_ov;
+      ZeroMemory(&hist_ov, sizeof(hist_ov));
+      hist_ov.hEvent = hist_event;
+
+      conpty_write_pipe_all(pipe, history, (unsigned long)hist_len, &hist_ov);
       HeapFree(GetProcessHeap(), 0, history);
     }
 
@@ -215,8 +270,36 @@ static unsigned long WINAPI conpty_pipe_server_thread(void* param) {
 
     char in_buf[CONPTY_IO_BUFFER];
     while (!InterlockedCompareExchange(&s->stop, 0, 0)) {
+      ResetEvent(read_event);
+      OVERLAPPED read_ov;
+      ZeroMemory(&read_ov, sizeof(read_ov));
+      read_ov.hEvent = read_event;
+
       unsigned long bytes_read = 0;
-      if (!ReadFile(pipe, in_buf, sizeof(in_buf), &bytes_read, NULL) || bytes_read == 0) {
+      BOOL ok = ReadFile(pipe, in_buf, sizeof(in_buf), &bytes_read, &read_ov);
+      if (!ok) {
+        unsigned long err = GetLastError();
+        if (err != ERROR_IO_PENDING) break;
+
+        bool got_data = false;
+        while (!InterlockedCompareExchange(&s->stop, 0, 0)) {
+          unsigned long wr = WaitForSingleObject(read_event, 200);
+          if (wr == WAIT_OBJECT_0) {
+            if (GetOverlappedResult(pipe, &read_ov, &bytes_read, FALSE) && bytes_read > 0) {
+              got_data = true;
+            }
+            break;
+          }
+          if (wr == WAIT_FAILED) break;
+        }
+
+        if (!got_data) {
+          if (imports.CancelIoEx) imports.CancelIoEx(pipe, &read_ov);
+          unsigned long dummy = 0;
+          GetOverlappedResult(pipe, &read_ov, &dummy, TRUE);
+          break;
+        }
+      } else if (bytes_read == 0) {
         break;
       }
 
@@ -235,10 +318,14 @@ static unsigned long WINAPI conpty_pipe_server_thread(void* param) {
     if (s->active_pipe == pipe) s->active_pipe = INVALID_HANDLE_VALUE;
     if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
 
+    if (imports.CancelIoEx) imports.CancelIoEx(pipe, NULL);
     DisconnectNamedPipe(pipe);
     CloseHandle(pipe);
   }
 
+  CloseHandle(connect_event);
+  CloseHandle(read_event);
+  CloseHandle(hist_event);
   if (psd) LocalFree(psd);
   return 0;
 }
@@ -348,18 +435,12 @@ void cleanup_conpty(nssm_service_t* service) {
 
   if (s->pipe_cs_initialised) EnterCriticalSection(&s->pipe_cs);
   if (s->active_pipe && s->active_pipe != INVALID_HANDLE_VALUE) {
-    imports.CancelIoEx(s->active_pipe, NULL);
+    if (imports.CancelIoEx) imports.CancelIoEx(s->active_pipe, NULL);
     DisconnectNamedPipe(s->active_pipe);
     CloseHandle(s->active_pipe);
     s->active_pipe = INVALID_HANDLE_VALUE;
   }
   if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
-
-  /* Poke the named pipe if ConnectNamedPipe() is waiting for a client. */
-  TCHAR pipe_name[MAX_PATH];
-  build_conpty_pipe_name(service->name, pipe_name, _countof(pipe_name));
-  HANDLE poke = CreateFile(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-  if (poke != INVALID_HANDLE_VALUE) CloseHandle(poke);
 
   if (s->hpc && imports.ClosePseudoConsole) {
     imports.ClosePseudoConsole(s->hpc);

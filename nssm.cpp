@@ -247,7 +247,6 @@ typedef struct {
   DWORD orig_out_mode;
   bool have_in_mode;
   bool have_out_mode;
-  volatile long stop;
 } attach_ctx_t;
 
 static void restore_attach_console(attach_ctx_t* ctx) {
@@ -262,7 +261,26 @@ static void restore_attach_console(attach_ctx_t* ctx) {
   }
 }
 
-static bool write_all(HANDLE h, const char* buf, DWORD len) {
+static bool write_all_overlapped(HANDLE h, const char* buf, DWORD len, HANDLE ev) {
+  DWORD sent = 0;
+  while (sent < len) {
+    OVERLAPPED ov;
+    ZeroMemory(&ov, sizeof(ov));
+    ov.hEvent = ev;
+    ResetEvent(ev);
+
+    DWORD written = 0;
+    if (!WriteFile(h, buf + sent, len - sent, &written, &ov)) {
+      if (GetLastError() != ERROR_IO_PENDING) return false;
+      if (!GetOverlappedResult(h, &ov, &written, TRUE)) return false;
+    }
+    if (written == 0) return false;
+    sent += written;
+  }
+  return true;
+}
+
+static bool write_all_sync(HANDLE h, const char* buf, DWORD len) {
   DWORD sent = 0;
   while (sent < len) {
     DWORD written = 0;
@@ -272,24 +290,6 @@ static bool write_all(HANDLE h, const char* buf, DWORD len) {
     sent += written;
   }
   return true;
-}
-
-static DWORD WINAPI pipe_reader_thread(void* param) {
-  attach_ctx_t* ctx = (attach_ctx_t*)param;
-  char buf[4096];
-
-  while (!InterlockedCompareExchange(&ctx->stop, 0, 0)) {
-    DWORD n = 0;
-    if (!ReadFile(ctx->pipe, buf, sizeof(buf), &n, NULL) || n == 0) {
-      break;
-    }
-    if (!write_all(ctx->stdout_h, buf, n)) {
-      break;
-    }
-  }
-
-  InterlockedExchange(&ctx->stop, 1);
-  return 0;
 }
 
 int attach_conpty_service(const TCHAR* service_name) {
@@ -302,10 +302,19 @@ int attach_conpty_service(const TCHAR* service_name) {
     0,
     NULL,
     OPEN_EXISTING,
-    0,
+    FILE_FLAG_OVERLAPPED,
     NULL);
   if (pipe == INVALID_HANDLE_VALUE) {
     _ftprintf(stderr, _T("%s: %s\n"), pipe_name, error_string(GetLastError()));
+    return 1;
+  }
+
+  HANDLE read_ev = CreateEvent(NULL, TRUE, FALSE, NULL);
+  HANDLE write_ev = CreateEvent(NULL, TRUE, FALSE, NULL);
+  if (!read_ev || !write_ev) {
+    if (read_ev) CloseHandle(read_ev);
+    if (write_ev) CloseHandle(write_ev);
+    CloseHandle(pipe);
     return 1;
   }
 
@@ -328,45 +337,90 @@ int attach_conpty_service(const TCHAR* service_name) {
     SetConsoleMode(ctx.stdout_h, ctx.orig_out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
   }
 
-  _ftprintf(stderr, _T("[Attached to %s — press Ctrl+] to detach]\r\n"), pipe_name);
+  char out_buf[4096];
+  OVERLAPPED rov;
+  ZeroMemory(&rov, sizeof(rov));
+  rov.hEvent = read_ev;
+  bool read_pending = false;
 
-  HANDLE reader = CreateThread(NULL, 0, pipe_reader_thread, &ctx, 0, NULL);
+  HANDLE waits[2];
+  DWORD wait_count = 0;
+  waits[wait_count++] = read_ev;
+  if (ctx.stdin_h != INVALID_HANDLE_VALUE) waits[wait_count++] = ctx.stdin_h;
 
-  char in_buf[256];
-  while (!InterlockedCompareExchange(&ctx.stop, 0, 0)) {
-    DWORD n = 0;
-    if (!ReadFile(ctx.stdin_h, in_buf, sizeof(in_buf), &n, NULL) || n == 0) {
-      break;
-    }
+  bool done = false;
+  while (!done) {
+    if (!read_pending) {
+      ResetEvent(read_ev);
+      ZeroMemory(&rov, sizeof(rov));
+      rov.hEvent = read_ev;
 
-    bool detach = false;
-    DWORD send_len = 0;
-    for (DWORD i = 0; i < n; i++) {
-      if (in_buf[i] == 0x1D) { /* Ctrl+] */
-        detach = true;
-        break;
+      DWORD n = 0;
+      if (ReadFile(pipe, out_buf, sizeof(out_buf), &n, &rov)) {
+        if (n == 0 || !write_all_sync(ctx.stdout_h, out_buf, n)) break;
+        continue;
       }
-      send_len++;
+      if (GetLastError() != ERROR_IO_PENDING) break;
+      read_pending = true;
     }
 
-    if (send_len > 0 && !write_all(pipe, in_buf, send_len)) {
-      break;
-    }
-    if (detach) {
-      break;
+    DWORD wr = WaitForMultipleObjects(wait_count, waits, FALSE, INFINITE);
+    if (wr == WAIT_FAILED) break;
+
+    DWORD idx = wr - WAIT_OBJECT_0;
+    if (idx >= wait_count) continue;
+
+    if (waits[idx] == read_ev) {
+      DWORD n = 0;
+      if (!GetOverlappedResult(pipe, &rov, &n, FALSE) || n == 0) break;
+      read_pending = false;
+      if (!write_all_sync(ctx.stdout_h, out_buf, n)) break;
+    } else if (waits[idx] == ctx.stdin_h) {
+      DWORD nev = 0;
+      while (!done && GetNumberOfConsoleInputEvents(ctx.stdin_h, &nev) && nev > 0) {
+        INPUT_RECORD peek;
+        DWORD peeked = 0;
+        if (!PeekConsoleInputW(ctx.stdin_h, &peek, 1, &peeked) || peeked == 0) {
+          break;
+        }
+
+        if (peek.EventType != KEY_EVENT || !peek.Event.KeyEvent.bKeyDown) {
+          INPUT_RECORD discard;
+          DWORD dropped = 0;
+          ReadConsoleInputW(ctx.stdin_h, &discard, 1, &dropped);
+          continue;
+        }
+
+        char ch = 0;
+        DWORD n = 0;
+        if (!ReadFile(ctx.stdin_h, &ch, 1, &n, NULL) || n == 0) {
+          done = true;
+          break;
+        }
+
+        if (ch == 0x1D) { /* Ctrl+] */
+          done = true;
+          break;
+        }
+
+        if (!write_all_overlapped(pipe, &ch, 1, write_ev)) {
+          done = true;
+          break;
+        }
+      }
     }
   }
 
-  InterlockedExchange(&ctx.stop, 1);
+  if (read_pending) {
+    CancelIo(pipe);
+    DWORD dummy = 0;
+    GetOverlappedResult(pipe, &rov, &dummy, TRUE);
+  }
+
+  CloseHandle(read_ev);
+  CloseHandle(write_ev);
   CloseHandle(pipe);
-
-  if (reader) {
-    WaitForSingleObject(reader, 1000);
-    CloseHandle(reader);
-  }
-
   restore_attach_console(&ctx);
-  _ftprintf(stderr, _T("\r\n[Detached]\n"));
   return 0;
 }
 
