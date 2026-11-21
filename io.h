@@ -40,5 +40,7 @@ int use_output_handles(nssm_service_t *, STARTUPINFO *);
 void close_output_handles(STARTUPINFO *);
 void cleanup_loggers(nssm_service_t *);
 unsigned long WINAPI log_and_rotate(void *);
+int setup_conpty(nssm_service_t* service, LPPROC_THREAD_ATTRIBUTE_LIST* attr_list_out);
+void cleanup_conpty(nssm_service_t* service);
 
 #endif

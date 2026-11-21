@@ -6,6 +6,403 @@
 #define TIMESTAMP_FORMAT "%04u-%02u-%02u %02u:%02u:%02u.%03u: "
 #define TIMESTAMP_LEN 25
 
+#define CONPTY_SCROLLBACK_BYTES (256 * 1024)
+#define CONPTY_IO_BUFFER 4096
+
+extern imports_t imports;
+
+typedef struct {
+  char* buf;
+  size_t capacity;
+  size_t head;
+  size_t len;
+  CRITICAL_SECTION cs;
+  bool cs_initialised;
+} conpty_ringbuf_t;
+
+typedef struct {
+  nssm_service_t* service;
+  HPCON hpc;
+  HANDLE in_write;
+  HANDLE out_read;
+  HANDLE active_pipe;
+  HANDLE drain_thread;
+  HANDLE pipe_thread;
+  volatile long stop;
+  CRITICAL_SECTION pipe_cs;
+  bool pipe_cs_initialised;
+  conpty_ringbuf_t ring;
+} conpty_session_t;
+
+static int ringbuf_init(conpty_ringbuf_t* ring, size_t capacity) {
+  ZeroMemory(ring, sizeof(*ring));
+  ring->buf = (char*)HeapAlloc(GetProcessHeap(), 0, capacity);
+  if (!ring->buf) return 1;
+
+  ring->capacity = capacity;
+  ring->head = 0;
+  ring->len = 0;
+  InitializeCriticalSection(&ring->cs);
+  ring->cs_initialised = true;
+  return 0;
+}
+
+static void ringbuf_destroy(conpty_ringbuf_t* ring) {
+  if (!ring) return;
+  if (ring->cs_initialised) {
+    DeleteCriticalSection(&ring->cs);
+    ring->cs_initialised = false;
+  }
+  if (ring->buf) {
+    HeapFree(GetProcessHeap(), 0, ring->buf);
+    ring->buf = NULL;
+  }
+  ring->capacity = 0;
+  ring->head = 0;
+  ring->len = 0;
+}
+
+static void ringbuf_append(conpty_ringbuf_t* ring, const char* data, size_t n) {
+  if (!ring || !ring->buf || !data || !n) return;
+
+  EnterCriticalSection(&ring->cs);
+  size_t cap = ring->capacity;
+
+  if (n >= cap) {
+    memmove(ring->buf, data + (n - cap), cap);
+    ring->head = 0;
+    ring->len = cap;
+    LeaveCriticalSection(&ring->cs);
+    return;
+  }
+
+  for (size_t i = 0; i < n; i++) {
+    size_t idx = (ring->head + ring->len) % cap;
+    if (ring->len == cap) {
+      ring->buf[ring->head] = data[i];
+      ring->head = (ring->head + 1) % cap;
+    } else {
+      ring->buf[idx] = data[i];
+      ring->len++;
+    }
+  }
+  LeaveCriticalSection(&ring->cs);
+}
+
+/* Allocates and returns a linear copy of the ring buffer; caller must HeapFree(). */
+static char* ringbuf_snapshot(conpty_ringbuf_t* ring, size_t* out_len) {
+  if (out_len) *out_len = 0;
+  if (!ring || !ring->buf) return NULL;
+
+  EnterCriticalSection(&ring->cs);
+  size_t len = ring->len;
+  char* copy = NULL;
+  if (len > 0) {
+    copy = (char*)HeapAlloc(GetProcessHeap(), 0, len);
+    if (copy) {
+      for (size_t i = 0; i < len; i++) {
+        copy[i] = ring->buf[(ring->head + i) % ring->capacity];
+      }
+      if (out_len) *out_len = len;
+    }
+  }
+  LeaveCriticalSection(&ring->cs);
+  return copy;
+}
+
+static void build_conpty_pipe_name(const TCHAR* service_name, TCHAR* buf, size_t buf_len) {
+  _sntprintf_s(buf, buf_len, _TRUNCATE, _T("\\\\.\\pipe\\nssm-conpty-%s"), service_name);
+}
+
+static int create_conpty_pipe_security(SECURITY_ATTRIBUTES* sa, PSECURITY_DESCRIPTOR* psd) {
+  /*
+    Allow SYSTEM and Administrators full access; Interactive Users read/write.
+    Tighten this SDDL if the hosted command requires stricter access control.
+  */
+  const wchar_t* sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, psd, NULL)) {
+    return 1;
+  }
+
+  ZeroMemory(sa, sizeof(*sa));
+  sa->nLength = sizeof(*sa);
+  sa->lpSecurityDescriptor = *psd;
+  sa->bInheritHandle = FALSE;
+  return 0;
+}
+
+static unsigned long WINAPI conpty_output_drain_thread(void* param) {
+  conpty_session_t* s = (conpty_session_t*)param;
+  char buf[CONPTY_IO_BUFFER];
+
+  while (!InterlockedCompareExchange(&s->stop, 0, 0)) {
+    unsigned long read_bytes = 0;
+    if (!ReadFile(s->out_read, buf, sizeof(buf), &read_bytes, NULL) || read_bytes == 0) {
+      break;
+    }
+
+    ringbuf_append(&s->ring, buf, read_bytes);
+
+    if (s->pipe_cs_initialised) EnterCriticalSection(&s->pipe_cs);
+    if (s->active_pipe && s->active_pipe != INVALID_HANDLE_VALUE) {
+      unsigned long sent = 0;
+      while (sent < read_bytes) {
+        unsigned long written = 0;
+        if (!WriteFile(s->active_pipe, buf + sent, read_bytes - sent, &written, NULL)) {
+          break;
+        }
+        sent += written;
+      }
+    }
+    if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
+  }
+
+  return 0;
+}
+
+static unsigned long WINAPI conpty_pipe_server_thread(void* param) {
+  conpty_session_t* s = (conpty_session_t*)param;
+  TCHAR pipe_name[MAX_PATH];
+  build_conpty_pipe_name(s->service->name, pipe_name, _countof(pipe_name));
+
+  SECURITY_ATTRIBUTES sa;
+  PSECURITY_DESCRIPTOR psd = NULL;
+  if (create_conpty_pipe_security(&sa, &psd)) {
+    log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_CREATEPIPE_FAILED, s->service->name, pipe_name, error_string(GetLastError()));
+    return 1;
+  }
+
+  while (!InterlockedCompareExchange(&s->stop, 0, 0)) {
+    HANDLE pipe = CreateNamedPipe(
+      pipe_name,
+      PIPE_ACCESS_DUPLEX,
+      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+      1,
+      CONPTY_IO_BUFFER,
+      CONPTY_IO_BUFFER,
+      0,
+      &sa);
+
+    if (pipe == INVALID_HANDLE_VALUE) {
+      unsigned long err = GetLastError();
+      if (!InterlockedCompareExchange(&s->stop, 0, 0)) {
+        log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_CREATEPIPE_FAILED, s->service->name, pipe_name, error_string(err));
+      }
+      break;
+    }
+
+    BOOL connected = ConnectNamedPipe(pipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+    if (!connected || InterlockedCompareExchange(&s->stop, 0, 0)) {
+      CloseHandle(pipe);
+      break;
+    }
+
+    size_t hist_len = 0;
+    char* history = ringbuf_snapshot(&s->ring, &hist_len);
+    if (history && hist_len > 0) {
+      if (s->pipe_cs_initialised) EnterCriticalSection(&s->pipe_cs);
+      unsigned long sent = 0;
+      while (sent < hist_len) {
+        unsigned long written = 0;
+        if (!WriteFile(pipe, history + sent, (unsigned long)(hist_len - sent), &written, NULL)) {
+          break;
+        }
+        sent += written;
+      }
+      if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
+      HeapFree(GetProcessHeap(), 0, history);
+    }
+
+    if (s->pipe_cs_initialised) EnterCriticalSection(&s->pipe_cs);
+    s->active_pipe = pipe;
+    if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
+
+    char in_buf[CONPTY_IO_BUFFER];
+    while (!InterlockedCompareExchange(&s->stop, 0, 0)) {
+      unsigned long bytes_read = 0;
+      if (!ReadFile(pipe, in_buf, sizeof(in_buf), &bytes_read, NULL) || bytes_read == 0) {
+        break;
+      }
+
+      unsigned long total_written = 0;
+      while (total_written < bytes_read) {
+        unsigned long written = 0;
+        if (!WriteFile(s->in_write, in_buf + total_written, bytes_read - total_written, &written, NULL)) {
+          InterlockedExchange(&s->stop, 1);
+          break;
+        }
+        total_written += written;
+      }
+    }
+
+    if (s->pipe_cs_initialised) EnterCriticalSection(&s->pipe_cs);
+    if (s->active_pipe == pipe) s->active_pipe = INVALID_HANDLE_VALUE;
+    if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
+
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
+  }
+
+  if (psd) LocalFree(psd);
+  return 0;
+}
+
+int setup_conpty(nssm_service_t* service, LPPROC_THREAD_ATTRIBUTE_LIST* attr_list_out) {
+  if (!service || !attr_list_out) return 1;
+  *attr_list_out = NULL;
+
+  if (!imports.CreatePseudoConsole ||
+      !imports.InitializeProcThreadAttributeList ||
+      !imports.UpdateProcThreadAttribute ||
+      !imports.DeleteProcThreadAttributeList) {
+    log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_GETPROCADDRESS_FAILED, _T("ConPTY"), _T("Required APIs unavailable on this OS"), 0);
+    return 2;
+  }
+
+  HANDLE in_read = INVALID_HANDLE_VALUE;
+  HANDLE in_write = INVALID_HANDLE_VALUE;
+  HANDLE out_read = INVALID_HANDLE_VALUE;
+  HANDLE out_write = INVALID_HANDLE_VALUE;
+
+  SECURITY_ATTRIBUTES sa;
+  ZeroMemory(&sa, sizeof(sa));
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = FALSE;
+
+  if (!CreatePipe(&in_read, &in_write, &sa, 0) || !CreatePipe(&out_read, &out_write, &sa, 0)) {
+    log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_CREATEPIPE_FAILED, service->name, _T("ConPTY"), error_string(GetLastError()));
+    if (in_read != INVALID_HANDLE_VALUE) CloseHandle(in_read);
+    if (in_write != INVALID_HANDLE_VALUE) CloseHandle(in_write);
+    if (out_read != INVALID_HANDLE_VALUE) CloseHandle(out_read);
+    if (out_write != INVALID_HANDLE_VALUE) CloseHandle(out_write);
+    return 3;
+  }
+
+  HPCON hpc = NULL;
+  COORD size = { 120, 30 };
+  HRESULT hr = imports.CreatePseudoConsole(size, in_read, out_write, 0, &hpc);
+  /* Close child-facing ends in parent after ConPTY duplicates them. */
+  CloseHandle(in_read);
+  CloseHandle(out_write);
+
+  if (FAILED(hr)) {
+    log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_CREATEPROCESS_FAILED, service->name, _T("CreatePseudoConsole"), error_string(HRESULT_CODE(hr)), 0);
+    CloseHandle(in_write);
+    CloseHandle(out_read);
+    return 4;
+  }
+
+  SIZE_T attr_size = 0;
+  imports.InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+  LPPROC_THREAD_ATTRIBUTE_LIST attr_list = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
+  if (!attr_list ||
+      !imports.InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size) ||
+      !imports.UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hpc, sizeof(HPCON), NULL, NULL)) {
+    log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_OUT_OF_MEMORY, _T("PROC_THREAD_ATTRIBUTE_LIST"), _T("setup_conpty()"), 0);
+    if (attr_list) {
+      imports.DeleteProcThreadAttributeList(attr_list);
+      HeapFree(GetProcessHeap(), 0, attr_list);
+    }
+    if (imports.ClosePseudoConsole) imports.ClosePseudoConsole(hpc);
+    CloseHandle(in_write);
+    CloseHandle(out_read);
+    return 5;
+  }
+
+  conpty_session_t* session = (conpty_session_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(conpty_session_t));
+  if (!session || ringbuf_init(&session->ring, CONPTY_SCROLLBACK_BYTES)) {
+    log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_OUT_OF_MEMORY, _T("conpty_session_t"), _T("setup_conpty()"), 0);
+    if (session) HeapFree(GetProcessHeap(), 0, session);
+    imports.DeleteProcThreadAttributeList(attr_list);
+    HeapFree(GetProcessHeap(), 0, attr_list);
+    if (imports.ClosePseudoConsole) imports.ClosePseudoConsole(hpc);
+    CloseHandle(in_write);
+    CloseHandle(out_read);
+    return 6;
+  }
+
+  session->service = service;
+  session->hpc = hpc;
+  session->in_write = in_write;
+  session->out_read = out_read;
+  session->active_pipe = INVALID_HANDLE_VALUE;
+  session->stop = 0;
+  InitializeCriticalSection(&session->pipe_cs);
+  session->pipe_cs_initialised = true;
+
+  unsigned long drain_tid = 0;
+  unsigned long pipe_tid = 0;
+  session->drain_thread = CreateThread(NULL, 0, conpty_output_drain_thread, session, 0, &drain_tid);
+  session->pipe_thread = CreateThread(NULL, 0, conpty_pipe_server_thread, session, 0, &pipe_tid);
+
+  service->conpty_handle = session;
+  service->conpty_in_write = in_write;
+  service->conpty_out_read = out_read;
+  service->conpty_drain_thread = session->drain_thread;
+  service->conpty_pipe_thread = session->pipe_thread;
+  *attr_list_out = attr_list;
+  return 0;
+}
+
+void cleanup_conpty(nssm_service_t* service) {
+  if (!service || !service->conpty_handle) return;
+
+  conpty_session_t* s = (conpty_session_t*)service->conpty_handle;
+  InterlockedExchange(&s->stop, 1);
+
+  if (s->pipe_cs_initialised) EnterCriticalSection(&s->pipe_cs);
+  if (s->active_pipe && s->active_pipe != INVALID_HANDLE_VALUE) {
+    imports.CancelIoEx(s->active_pipe, NULL);
+    DisconnectNamedPipe(s->active_pipe);
+    CloseHandle(s->active_pipe);
+    s->active_pipe = INVALID_HANDLE_VALUE;
+  }
+  if (s->pipe_cs_initialised) LeaveCriticalSection(&s->pipe_cs);
+
+  /* Poke the named pipe if ConnectNamedPipe() is waiting for a client. */
+  TCHAR pipe_name[MAX_PATH];
+  build_conpty_pipe_name(service->name, pipe_name, _countof(pipe_name));
+  HANDLE poke = CreateFile(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+  if (poke != INVALID_HANDLE_VALUE) CloseHandle(poke);
+
+  if (s->hpc && imports.ClosePseudoConsole) {
+    imports.ClosePseudoConsole(s->hpc);
+    s->hpc = NULL;
+  }
+  if (s->in_write != INVALID_HANDLE_VALUE) {
+    CloseHandle(s->in_write);
+    s->in_write = INVALID_HANDLE_VALUE;
+  }
+  if (s->out_read != INVALID_HANDLE_VALUE) {
+    CloseHandle(s->out_read);
+    s->out_read = INVALID_HANDLE_VALUE;
+  }
+
+  if (s->pipe_thread) {
+    WaitForSingleObject(s->pipe_thread, NSSM_CLEANUP_LOGGERS_DEADLINE);
+    CloseHandle(s->pipe_thread);
+    s->pipe_thread = NULL;
+  }
+  if (s->drain_thread) {
+    WaitForSingleObject(s->drain_thread, NSSM_CLEANUP_LOGGERS_DEADLINE);
+    CloseHandle(s->drain_thread);
+    s->drain_thread = NULL;
+  }
+
+  if (s->pipe_cs_initialised) {
+    DeleteCriticalSection(&s->pipe_cs);
+    s->pipe_cs_initialised = false;
+  }
+  ringbuf_destroy(&s->ring);
+  HeapFree(GetProcessHeap(), 0, s);
+
+  service->conpty_handle = NULL;
+  service->conpty_in_write = NULL;
+  service->conpty_out_read = NULL;
+  service->conpty_pipe_thread = NULL;
+  service->conpty_drain_thread = NULL;
+}
+
 static int dup_handle(HANDLE source_handle, HANDLE *dest_handle_ptr, TCHAR *source_description, TCHAR *dest_description, unsigned long flags) {
   if (! dest_handle_ptr) return 1;
 

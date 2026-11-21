@@ -1872,48 +1872,84 @@ int start_service(nssm_service_t *service) {
 
   /* Did another thread receive a stop control? */
   if (service->allow_restart) {
-    /* Set up I/O redirection. */
-    if (get_output_handles(service, &si)) {
-      log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_GET_OUTPUT_HANDLES_FAILED, service->name, 0);
-      FreeConsole();
-      close_output_handles(&si);
-      unset_service_environment(service);
-      return stop_service(service, 4, true, true);
-    }
-    FreeConsole();
+    LPPROC_THREAD_ATTRIBUTE_LIST attr_list = NULL;
+    STARTUPINFOEX si_ex;
+    ZeroMemory(&si_ex, sizeof(si_ex));
+    si_ex.StartupInfo = si;
 
-    /* Pre-start hook. May need I/O to have been redirected already. */
+    if (service->use_conpty) {
+      if (setup_conpty(service, &attr_list)) {
+        log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_GET_OUTPUT_HANDLES_FAILED, service->name, 0);
+        cleanup_conpty(service);
+        unset_service_environment(service);
+        return stop_service(service, 4, true, true);
+      }
+      si_ex.StartupInfo.cb = sizeof(STARTUPINFOEX);
+      si_ex.lpAttributeList = attr_list;
+    } else {
+      /* Set up I/O redirection. */
+      if (get_output_handles(service, &si)) {
+        log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_GET_OUTPUT_HANDLES_FAILED, service->name, 0);
+        FreeConsole();
+        close_output_handles(&si);
+        unset_service_environment(service);
+        return stop_service(service, 4, true, true);
+      }
+      FreeConsole();
+      si_ex.StartupInfo = si;
+      si_ex.StartupInfo.cb = sizeof(STARTUPINFOEX);
+    }
+
+    /* Pre-start hook. */
     if (nssm_hook(&hook_threads, service, NSSM_HOOK_EVENT_START, NSSM_HOOK_ACTION_PRE, &control, NSSM_SERVICE_STATUS_DEADLINE, false) == NSSM_HOOK_STATUS_ABORT) {
       TCHAR code[16];
       _sntprintf_s(code, _countof(code), _TRUNCATE, _T("%lu"), NSSM_HOOK_STATUS_ABORT);
       log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_PRESTART_HOOK_ABORT, NSSM_HOOK_EVENT_START, NSSM_HOOK_ACTION_PRE, service->name, code, 0);
+      if (attr_list) {
+        imports.DeleteProcThreadAttributeList(attr_list);
+        HeapFree(GetProcessHeap(), 0, attr_list);
+      }
+      cleanup_conpty(service);
       unset_service_environment(service);
       return stop_service(service, 5, true, true);
     }
 
-    /* The pre-start hook will have cleaned the environment. */
     set_service_environment(service);
 
     bool inherit_handles = false;
-    if (si.dwFlags & STARTF_USESTDHANDLES) inherit_handles = true;
+    if (!service->use_conpty && (si_ex.StartupInfo.dwFlags & STARTF_USESTDHANDLES)) inherit_handles = true;
     unsigned long flags = service->priority & priority_mask();
     if (service->affinity) flags |= CREATE_SUSPENDED;
-    if (! service->no_console) flags |= CREATE_NEW_CONSOLE;
-    if (! CreateProcess(0, cmd, 0, 0, inherit_handles, flags, 0, service->dir, &si, &pi)) {
+    if (service->use_conpty) {
+      flags |= EXTENDED_STARTUPINFO_PRESENT;
+    } else if (!service->no_console) {
+      flags |= CREATE_NEW_CONSOLE;
+    }
+
+    BOOL created = CreateProcess(0, cmd, 0, 0, inherit_handles, flags, 0, service->dir, &si_ex.StartupInfo, &pi);
+    DWORD create_err = GetLastError();
+
+    if (attr_list) {
+      imports.DeleteProcThreadAttributeList(attr_list);
+      HeapFree(GetProcessHeap(), 0, attr_list);
+    }
+
+    if (!created) {
       unsigned long exitcode = 3;
-      unsigned long error = GetLastError();
-      log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_CREATEPROCESS_FAILED, service->name, service->exe, error_string(error), 0);
-      close_output_handles(&si);
+      log_event(EVENTLOG_ERROR_TYPE, NSSM_EVENT_CREATEPROCESS_FAILED, service->name, service->exe, error_string(create_err), 0);
+      if (!service->use_conpty) close_output_handles(&si_ex.StartupInfo);
+      cleanup_conpty(service);
       unset_service_environment(service);
       return stop_service(service, exitcode, true, true);
     }
+
     service->start_count++;
     service->process_handle = pi.hProcess;
     service->pid = pi.dwProcessId;
 
     if (get_process_creation_time(service->process_handle, &service->creation_time)) ZeroMemory(&service->creation_time, sizeof(service->creation_time));
 
-    close_output_handles(&si);
+    if (!service->use_conpty) close_output_handles(&si_ex.StartupInfo);
 
     if (service->affinity) {
       /*
@@ -2075,6 +2111,9 @@ void CALLBACK end_service(void *arg, unsigned char why) {
   /* Exit hook. */
   service->exit_count++;
   (void) nssm_hook(&hook_threads, service, NSSM_HOOK_EVENT_EXIT, NSSM_HOOK_ACTION_POST, NULL, NSSM_HOOK_DEADLINE, true);
+
+  /* Tidy up ConPTY as applicable. */
+  cleanup_conpty(service);
 
   /* Exit logging threads. */
   cleanup_loggers(service);

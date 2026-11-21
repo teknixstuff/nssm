@@ -44,6 +44,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <shlwapi.h>
+#include <sddl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include "utf8.h"

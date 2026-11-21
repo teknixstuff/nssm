@@ -65,6 +65,41 @@ int get_imports() {
     if (! imports.WakeConditionVariable) {
       if (error != ERROR_PROC_NOT_FOUND) return 5;
     }
+
+    imports.InitializeProcThreadAttributeList = (InitializeProcThreadAttributeList_ptr)get_import(imports.kernel32, "InitializeProcThreadAttributeList", &error);
+    if (!imports.InitializeProcThreadAttributeList) {
+      if (error != ERROR_PROC_NOT_FOUND) return 9;
+    }
+
+    imports.UpdateProcThreadAttribute = (UpdateProcThreadAttribute_ptr)get_import(imports.kernel32, "UpdateProcThreadAttribute", &error);
+    if (!imports.UpdateProcThreadAttribute) {
+      if (error != ERROR_PROC_NOT_FOUND) return 10;
+    }
+
+    imports.DeleteProcThreadAttributeList = (DeleteProcThreadAttributeList_ptr)get_import(imports.kernel32, "DeleteProcThreadAttributeList", &error);
+    if (!imports.DeleteProcThreadAttributeList) {
+      if (error != ERROR_PROC_NOT_FOUND) return 11;
+    }
+
+    imports.CancelIoEx = (CancelIoEx_ptr)get_import(imports.kernel32, "CancelIoEx", &error);
+    if (!imports.CancelIoEx) {
+      if (error != ERROR_PROC_NOT_FOUND) return 12;
+    }
+
+    imports.CreatePseudoConsole = (CreatePseudoConsole_ptr)get_import(imports.kernel32, "CreatePseudoConsole", &error);
+    if (!imports.CreatePseudoConsole) {
+      if (error != ERROR_PROC_NOT_FOUND) return 13;
+    }
+
+    imports.ResizePseudoConsole = (ResizePseudoConsole_ptr)get_import(imports.kernel32, "ResizePseudoConsole", &error);
+    if (!imports.ResizePseudoConsole) {
+      if (error != ERROR_PROC_NOT_FOUND) return 14;
+    }
+
+    imports.ClosePseudoConsole = (ClosePseudoConsole_ptr)get_import(imports.kernel32, "ClosePseudoConsole", &error);
+    if (!imports.ClosePseudoConsole) {
+      if (error != ERROR_PROC_NOT_FOUND) return 15;
+    }
   }
   else if (error != ERROR_MOD_NOT_FOUND) return 1;
 

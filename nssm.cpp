@@ -239,6 +239,129 @@ const TCHAR *nssm_exe() {
   return imageargv0;
 }
 
+struct attach_ctx_t {
+  HANDLE pipe;
+  HANDLE stdin_h;
+  HANDLE stdout_h;
+  DWORD orig_in_mode;
+  DWORD orig_out_mode;
+  bool have_in_mode;
+  bool have_out_mode;
+  volatile LONG stop;
+};
+
+static void restore_attach_console(attach_ctx_t* ctx) {
+  if (ctx->have_in_mode && ctx->stdin_h != INVALID_HANDLE_VALUE) {
+    SetConsoleMode(ctx->stdin_h, ctx->orig_in_mode);
+  }
+  if (ctx->have_out_mode && ctx->stdout_h != INVALID_HANDLE_VALUE) {
+    SetConsoleMode(ctx->stdout_h, ctx->orig_out_mode);
+  }
+}
+
+static DWORD WINAPI attach_pipe_to_stdout(LPVOID param) {
+  auto* ctx = static_cast<attach_ctx_t*>(param);
+  char buf[4096];
+
+  while (!InterlockedCompareExchange(&ctx->stop, 0, 0)) {
+    DWORD bytes_read = 0;
+    if (!ReadFile(ctx->pipe, buf, sizeof(buf), &bytes_read, NULL) || bytes_read == 0) {
+      break;
+    }
+    DWORD total = 0;
+    while (total < bytes_read) {
+      DWORD written = 0;
+      if (!WriteFile(ctx->stdout_h, buf + total, bytes_read - total, &written, NULL)) {
+        break;
+      }
+      total += written;
+    }
+  }
+
+  InterlockedExchange(&ctx->stop, 1);
+  imports.CancelIoEx(ctx->stdin_h, NULL);
+  return 0;
+}
+
+int attach_conpty_service(const TCHAR* service_name) {
+  TCHAR pipe_name[MAX_PATH];
+  _sntprintf_s(pipe_name, _countof(pipe_name), _TRUNCATE, _T("\\\\.\\pipe\\nssm-conpty-%s"), service_name);
+
+  HANDLE pipe = CreateFile(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+  if (pipe == INVALID_HANDLE_VALUE) {
+    _ftprintf(stderr, _T("%s: %s\n"), pipe_name, error_string(GetLastError()));
+    return 1;
+  }
+
+  attach_ctx_t ctx;
+  ZeroMemory(&ctx, sizeof(ctx));
+  ctx.pipe = pipe;
+  ctx.stdin_h = GetStdHandle(STD_INPUT_HANDLE);
+  ctx.stdout_h = GetStdHandle(STD_OUTPUT_HANDLE);
+
+  if (GetConsoleMode(ctx.stdin_h, &ctx.orig_in_mode)) {
+    ctx.have_in_mode = true;
+    DWORD raw_in = ctx.orig_in_mode;
+    raw_in &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+    raw_in |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+    SetConsoleMode(ctx.stdin_h, raw_in);
+  }
+
+  if (GetConsoleMode(ctx.stdout_h, &ctx.orig_out_mode)) {
+    ctx.have_out_mode = true;
+    SetConsoleMode(ctx.stdout_h, ctx.orig_out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+  }
+
+  _ftprintf(stderr, _T("[Attached to %s — press Ctrl+] to detach]\r\n"), pipe_name);
+
+  HANDLE reader = CreateThread(NULL, 0, attach_pipe_to_stdout, &ctx, 0, NULL);
+
+  char in_buf[256];
+  while (!InterlockedCompareExchange(&ctx.stop, 0, 0)) {
+    DWORD bytes_read = 0;
+    if (!ReadFile(ctx.stdin_h, in_buf, sizeof(in_buf), &bytes_read, NULL) || bytes_read == 0) {
+      break;
+    }
+
+    bool detach = false;
+    DWORD send_len = 0;
+    for (DWORD i = 0; i < bytes_read; ++i) {
+      if (in_buf[i] == 0x1D) { /* Ctrl+] */
+        detach = true;
+        break;
+      }
+      ++send_len;
+    }
+
+    if (send_len > 0) {
+      DWORD total = 0;
+      while (total < send_len) {
+        DWORD written = 0;
+        if (!WriteFile(pipe, in_buf + total, send_len - total, &written, NULL)) {
+          InterlockedExchange(&ctx.stop, 1);
+          break;
+        }
+        total += written;
+      }
+    }
+
+    if (detach) {
+      InterlockedExchange(&ctx.stop, 1);
+      break;
+    }
+  }
+
+  InterlockedExchange(&ctx.stop, 1);
+  CloseHandle(pipe);
+  if (reader) {
+    WaitForSingleObject(reader, 1000);
+    CloseHandle(reader);
+  }
+  restore_attach_console(&ctx);
+  _ftprintf(stderr, _T("\r\n[Detached]\n"));
+  return 0;
+}
+
 int _tmain(int argc, TCHAR **argv) {
   if (check_console()) setup_utf8();
 
@@ -295,6 +418,10 @@ int _tmain(int argc, TCHAR **argv) {
     if (str_equiv(argv[1], _T("remove"))) {
       if (! is_admin) nssm_exit(elevate(argc, argv, NSSM_MESSAGE_NOT_ADMINISTRATOR_CANNOT_REMOVE));
       nssm_exit(pre_remove_service(argc - 2, argv + 2));
+    }
+    if (str_equiv(argv[1], _T("attach"))) {
+      if (argc < 3) nssm_exit(usage(1));
+      nssm_exit(attach_conpty_service(argv[2]));
     }
   }
 

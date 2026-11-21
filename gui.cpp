@@ -181,6 +181,7 @@ int nssm_gui(int resource, nssm_service_t *service) {
     SetDlgItemText(tablist[NSSM_TAB_IO], IDC_STDOUT, service->stdout_path);
     SetDlgItemText(tablist[NSSM_TAB_IO], IDC_STDERR, service->stderr_path);
     if (service->timestamp_log) SendDlgItemMessage(tablist[NSSM_TAB_IO], IDC_TIMESTAMP, BM_SETCHECK, BST_CHECKED, 0);
+    if (service->use_conpty) SendDlgItemMessage(tablist[NSSM_TAB_IO], IDC_USECONPTY, BM_SETCHECK, BST_CHECKED, 0);
 
     /* Rotation tab. */
     if (service->stdout_disposition == CREATE_ALWAYS) SendDlgItemMessage(tablist[NSSM_TAB_ROTATION], IDC_TRUNCATE, BM_SETCHECK, BST_CHECKED, 0);
@@ -679,6 +680,8 @@ int configure(HWND window, nssm_service_t *service, nssm_service_t *orig_service
   check_io(window, _T("stderr"), service->stderr_path, _countof(service->stderr_path), IDC_STDERR);
   if (SendDlgItemMessage(tablist[NSSM_TAB_IO], IDC_TIMESTAMP, BM_GETCHECK, 0, 0) & BST_CHECKED) service->timestamp_log = true;
   else service->timestamp_log = false;
+  if (SendDlgItemMessage(tablist[NSSM_TAB_IO], IDC_USECONPTY, BM_GETCHECK, 0, 0) & BST_CHECKED) service->use_conpty = true;
+  else service->use_conpty = false;
 
   /* Override stdout and/or stderr. */
   if (SendDlgItemMessage(tablist[NSSM_TAB_ROTATION], IDC_TRUNCATE, BM_GETCHECK, 0, 0) & BST_CHECKED) {

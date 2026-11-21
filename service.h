@@ -120,6 +120,12 @@ typedef struct {
   unsigned long start_count;
   unsigned long exit_count;
   bool use_conpty;
+  void* conpty_handle;
+  HANDLE conpty_in_write;
+  HANDLE conpty_out_read;
+  HANDLE conpty_pipe_thread;
+  HANDLE conpty_drain_thread;
+  volatile long conpty_stop;
 } nssm_service_t;
 
 void WINAPI service_main(unsigned long, TCHAR **);
