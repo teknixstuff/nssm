@@ -247,28 +247,49 @@ typedef struct {
   DWORD orig_out_mode;
   bool have_in_mode;
   bool have_out_mode;
+  volatile long stop;
 } attach_ctx_t;
 
 static void restore_attach_console(attach_ctx_t* ctx) {
   if (!ctx) return;
+  if (ctx->have_out_mode && ctx->stdout_h != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    WriteFile(ctx->stdout_h, "\x1b[0m", 4, &written, NULL);
+    SetConsoleMode(ctx->stdout_h, ctx->orig_out_mode);
+  }
   if (ctx->have_in_mode && ctx->stdin_h != INVALID_HANDLE_VALUE) {
     SetConsoleMode(ctx->stdin_h, ctx->orig_in_mode);
   }
-  if (ctx->have_out_mode && ctx->stdout_h != INVALID_HANDLE_VALUE) {
-    SetConsoleMode(ctx->stdout_h, ctx->orig_out_mode);
-  }
 }
 
-static bool write_all_bytes(HANDLE h, const char* data, unsigned long len) {
-  unsigned long total = 0;
-  while (total < len) {
-    unsigned long written = 0;
-    if (!WriteFile(h, data + total, len - total, &written, NULL)) {
+static bool write_all(HANDLE h, const char* buf, DWORD len) {
+  DWORD sent = 0;
+  while (sent < len) {
+    DWORD written = 0;
+    if (!WriteFile(h, buf + sent, len - sent, &written, NULL) || written == 0) {
       return false;
     }
-    total += written;
+    sent += written;
   }
   return true;
+}
+
+static DWORD WINAPI pipe_reader_thread(void* param) {
+  attach_ctx_t* ctx = (attach_ctx_t*)param;
+  char buf[4096];
+
+  while (!InterlockedCompareExchange(&ctx->stop, 0, 0)) {
+    DWORD n = 0;
+    if (!ReadFile(ctx->pipe, buf, sizeof(buf), &n, NULL) || n == 0) {
+      break;
+    }
+    if (!write_all(ctx->stdout_h, buf, n)) {
+      break;
+    }
+  }
+
+  InterlockedExchange(&ctx->stop, 1);
+  return 0;
 }
 
 int attach_conpty_service(const TCHAR* service_name) {
@@ -281,16 +302,10 @@ int attach_conpty_service(const TCHAR* service_name) {
     0,
     NULL,
     OPEN_EXISTING,
-    FILE_FLAG_OVERLAPPED,
+    0,
     NULL);
   if (pipe == INVALID_HANDLE_VALUE) {
     _ftprintf(stderr, _T("%s: %s\n"), pipe_name, error_string(GetLastError()));
-    return 1;
-  }
-
-  HANDLE pipe_read_event = CreateEvent(NULL, TRUE, FALSE, NULL);
-  if (!pipe_read_event) {
-    CloseHandle(pipe);
     return 1;
   }
 
@@ -302,10 +317,10 @@ int attach_conpty_service(const TCHAR* service_name) {
 
   if (ctx.stdin_h != INVALID_HANDLE_VALUE && GetConsoleMode(ctx.stdin_h, &ctx.orig_in_mode)) {
     ctx.have_in_mode = true;
-    unsigned long in_mode = ctx.orig_in_mode;
-    in_mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
-    in_mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
-    SetConsoleMode(ctx.stdin_h, in_mode);
+    DWORD mode = ctx.orig_in_mode;
+    mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE);
+    mode |= ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT;
+    SetConsoleMode(ctx.stdin_h, mode);
   }
 
   if (ctx.stdout_h != INVALID_HANDLE_VALUE && GetConsoleMode(ctx.stdout_h, &ctx.orig_out_mode)) {
@@ -315,89 +330,41 @@ int attach_conpty_service(const TCHAR* service_name) {
 
   _ftprintf(stderr, _T("[Attached to %s — press Ctrl+] to detach]\r\n"), pipe_name);
 
-  char pipe_buf[4096];
-  OVERLAPPED ov;
-  ZeroMemory(&ov, sizeof(ov));
-  ov.hEvent = pipe_read_event;
-  bool read_pending = false;
+  HANDLE reader = CreateThread(NULL, 0, pipe_reader_thread, &ctx, 0, NULL);
 
-  HANDLE waits[2];
-  unsigned long wait_count = 0;
-  waits[wait_count++] = pipe_read_event;
-  if (ctx.stdin_h != INVALID_HANDLE_VALUE) waits[wait_count++] = ctx.stdin_h;
-
-  bool done = false;
-  while (!done) {
-    if (!read_pending) {
-      ResetEvent(pipe_read_event);
-      unsigned long bytes_read = 0;
-      BOOL ok = ReadFile(pipe, pipe_buf, sizeof(pipe_buf), &bytes_read, &ov);
-      if (ok) {
-        if (bytes_read == 0 || !write_all_bytes(ctx.stdout_h, pipe_buf, bytes_read)) {
-          break;
-        }
-        continue;
-      }
-      unsigned long err = GetLastError();
-      if (err == ERROR_IO_PENDING) {
-        read_pending = true;
-      } else {
-        break;
-      }
+  char in_buf[256];
+  while (!InterlockedCompareExchange(&ctx.stop, 0, 0)) {
+    DWORD n = 0;
+    if (!ReadFile(ctx.stdin_h, in_buf, sizeof(in_buf), &n, NULL) || n == 0) {
+      break;
     }
 
-    unsigned long wr = WaitForMultipleObjects(wait_count, waits, FALSE, INFINITE);
-    if (wr == WAIT_FAILED) break;
-
-    unsigned long idx = wr - WAIT_OBJECT_0;
-    if (idx >= wait_count) continue;
-
-    HANDLE signaled = waits[idx];
-    if (signaled == pipe_read_event) {
-      unsigned long bytes_read = 0;
-      if (!GetOverlappedResult(pipe, &ov, &bytes_read, FALSE) || bytes_read == 0) {
+    bool detach = false;
+    DWORD send_len = 0;
+    for (DWORD i = 0; i < n; i++) {
+      if (in_buf[i] == 0x1D) { /* Ctrl+] */
+        detach = true;
         break;
       }
-      read_pending = false;
-      if (!write_all_bytes(ctx.stdout_h, pipe_buf, bytes_read)) {
-        break;
-      }
-    } else if (signaled == ctx.stdin_h) {
-      unsigned long events = 0;
-      while (GetNumberOfConsoleInputEvents(ctx.stdin_h, &events) && events > 0) {
-        char in_buf[256];
-        unsigned long bytes_read = 0;
-        if (!ReadFile(ctx.stdin_h, in_buf, sizeof(in_buf), &bytes_read, NULL) || bytes_read == 0) {
-          done = true;
-          break;
-        }
+      send_len++;
+    }
 
-        unsigned long send_len = 0;
-        for (unsigned long i = 0; i < bytes_read; i++) {
-          if (in_buf[i] == 0x1D) { /* Ctrl+] */
-            done = true;
-            break;
-          }
-          send_len++;
-        }
-
-        if (send_len > 0 && !write_all_bytes(pipe, in_buf, send_len)) {
-          done = true;
-          break;
-        }
-
-        if (done) break;
-      }
+    if (send_len > 0 && !write_all(pipe, in_buf, send_len)) {
+      break;
+    }
+    if (detach) {
+      break;
     }
   }
 
-  if (read_pending) {
-    CancelIo(pipe);
-    unsigned long dummy = 0;
-    GetOverlappedResult(pipe, &ov, &dummy, TRUE);
-  }
-  CloseHandle(pipe_read_event);
+  InterlockedExchange(&ctx.stop, 1);
   CloseHandle(pipe);
+
+  if (reader) {
+    WaitForSingleObject(reader, 1000);
+    CloseHandle(reader);
+  }
+
   restore_attach_console(&ctx);
   _ftprintf(stderr, _T("\r\n[Detached]\n"));
   return 0;

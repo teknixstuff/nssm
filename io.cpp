@@ -115,11 +115,7 @@ static void build_conpty_pipe_name(const TCHAR* service_name, TCHAR* buf, size_t
 }
 
 static int create_conpty_pipe_security(SECURITY_ATTRIBUTES* sa, PSECURITY_DESCRIPTOR* psd) {
-  /*
-    Allow SYSTEM and Administrators full access; Interactive Users read/write.
-    Tighten this SDDL if the hosted command requires stricter access control.
-  */
-  const wchar_t* sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+  const wchar_t* sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)";
   if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, psd, NULL)) {
     return 1;
   }
