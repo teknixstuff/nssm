@@ -1,0 +1,9 @@
+.vs
+out
+tmp
+version.h
+*.vcxproj.user
+MSG*.bin
+messages.rc
+messages.h
+*.aps
